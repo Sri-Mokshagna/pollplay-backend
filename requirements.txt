@@ -1,0 +1,7 @@
+fastapi
+sqlalchemy
+pydantic
+python-dateutil
+firebase-admin
+pytz
+uvicorn
