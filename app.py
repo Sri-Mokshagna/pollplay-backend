@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, messaging
 import pytz
+import os
+from pathlib import Path
 
 # Set IST timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -319,6 +321,10 @@ class ApplyReferralBody(BaseModel):
 class CoinValueBody(BaseModel):
     coinValueINR: float
 
+class ReferralRewardsBody(BaseModel):
+    referrerCoins: int
+    refereeCoins: int
+
 # App
 
 app = FastAPI()
@@ -411,6 +417,30 @@ def get_polls(db: Session = Depends(get_db)):
         polls.append(db_to_poll(p, db))
     return polls
 
+# Trending polls for a particular day (default: today, IST)
+@app.get("/trending", response_model=List[Poll])
+def get_trending(date: Optional[str] = None, db: Session = Depends(get_db)):
+    # date in format YYYY-MM-DD; default to today in IST
+    if date:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    else:
+        target_date = datetime.now(IST).date()
+
+    polls_db = db.query(PollDB).all()
+    todays = []
+    for p in polls_db:
+        if not p.createdAt:
+            continue
+        if p.createdAt.astimezone(IST).date() == target_date:
+            todays.append(p)
+
+    # Sort by total votes desc
+    todays.sort(key=lambda poll: sum(opt.votes or 0 for opt in poll.options), reverse=True)
+    return [db_to_poll(p, db) for p in todays]
+
 @app.get("/polls/{poll_id}", response_model=Poll)
 def get_poll(poll_id: str, db: Session = Depends(get_db)):
     poll_db = db.query(PollDB).filter(PollDB.id == poll_id).first()
@@ -471,6 +501,21 @@ def add_vote(poll_id: str, option_id: str = Query(...), user_id: str = Query(...
     votedBy.append(user_id)
     opt_db.votes += 1
     opt_db.votedBy = json.dumps(votedBy)
+    # Increment user coins by 1 for this vote (with logging)
+    user_db = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if user_db:
+        try:
+            before = int(user_db.coins or 0)
+            after = before + 1
+            user_db.coins = after
+            print(f"[coins] add_vote: user={user_id} before={before} after={after}")
+        except Exception as e:
+            # fallback to simple increment
+            try:
+                user_db.coins = (user_db.coins or 0) + 1
+                print(f"[coins] add_vote fallback increment for user={user_id}")
+            except Exception as e2:
+                print(f"[coins] add_vote failed for user={user_id}: {e} / {e2}")
     db.commit()
     return db_to_poll(poll_db, db)
 
@@ -618,10 +663,102 @@ def get_users(db: Session = Depends(get_db)):
     users_db = db.query(UserDB).all()
     return [db_to_user(u) for u in users_db]
 
-@app.get("/categories", response_model=List[Category])
-def get_categories(db: Session = Depends(get_db)):
-    cats = db.query(CategoryDB).all()
-    return [Category(id=c.id, name=c.name) for c in cats]
+# Settings helpers
+def get_setting(db: Session, key: str, default: str | None = None) -> Optional[str]:
+    s = db.query(SettingsDB).filter(SettingsDB.key == key).first()
+    return s.value if s else default
+
+def set_setting(db: Session, key: str, value: str) -> None:
+    s = db.query(SettingsDB).filter(SettingsDB.key == key).first()
+    if s:
+        s.value = value
+    else:
+        s = SettingsDB(key=key, value=value)
+        db.add(s)
+    db.commit()
+
+@app.get("/settings/coin-value")
+def get_coin_value(db: Session = Depends(get_db)):
+    val = get_setting(db, "coinValueINR", "0")
+    try:
+        coin_val = float(val) if val is not None else 0.0
+    except ValueError:
+        coin_val = 0.0
+    return {"coinValueINR": coin_val}
+
+@app.put("/settings/coin-value")
+def put_coin_value(body: CoinValueBody, db: Session = Depends(get_db)):
+    set_setting(db, "coinValueINR", str(body.coinValueINR))
+    return {"success": True}
+
+@app.get("/settings/referral-rewards")
+def get_referral_rewards(db: Session = Depends(get_db)):
+    # Defaults: referee 5, referrer 15
+    referrer = get_setting(db, "referralReferrerCoins", "15")
+    referee = get_setting(db, "referralRefereeCoins", "5")
+    try:
+        referrer_i = int(referrer) if referrer is not None else 15
+    except ValueError:
+        referrer_i = 15
+    try:
+        referee_i = int(referee) if referee is not None else 5
+    except ValueError:
+        referee_i = 5
+    return {"referrerCoins": referrer_i, "refereeCoins": referee_i}
+
+@app.put("/settings/referral-rewards")
+def put_referral_rewards(body: ReferralRewardsBody, db: Session = Depends(get_db)):
+    set_setting(db, "referralReferrerCoins", str(body.referrerCoins))
+    set_setting(db, "referralRefereeCoins", str(body.refereeCoins))
+    return {"success": True}
+
+@app.post("/referral/apply")
+def apply_referral(body: ApplyReferralBody, db: Session = Depends(get_db)):
+    joiner = db.query(UserDB).filter(UserDB.id == body.joinerUserId).first()
+    if not joiner:
+        raise HTTPException(status_code=404, detail="Joiner user not found")
+    if joiner.referredBy:
+        raise HTTPException(status_code=400, detail="Referral already applied for this user")
+    # Find referrer by referral code
+    referrer = db.query(UserDB).filter(UserDB.referralCode == body.referralCode).first()
+    if not referrer:
+        raise HTTPException(status_code=404, detail="Invalid referral code")
+    if referrer.id == joiner.id:
+        raise HTTPException(status_code=400, detail="Cannot refer yourself")
+
+    # Read rewards
+    rewards = get_referral_rewards(db)
+    referrer_reward = rewards["referrerCoins"]
+    referee_reward = rewards["refereeCoins"]
+
+    # Apply atomically
+    try:
+        try:
+            before_joiner = int(joiner.coins or 0)
+        except Exception:
+            before_joiner = 0
+        try:
+            before_referrer = int(referrer.coins or 0)
+        except Exception:
+            before_referrer = 0
+
+        joiner.coins = int(joiner.coins or 0) + int(referee_reward)
+        joiner.referredBy = referrer.id
+        referrer.coins = int(referrer.coins or 0) + int(referrer_reward)
+        db.commit()
+
+        after_joiner = int(joiner.coins or 0)
+        after_referrer = int(referrer.coins or 0)
+        print(f"[coins] apply_referral: joiner={joiner.id} before={before_joiner} after={after_joiner}; referrer={referrer.id} before={before_referrer} after={after_referrer}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to apply referral: {e}")
+
+    return {
+        "success": True,
+        "referrer": db_to_user(referrer),
+        "referee": db_to_user(joiner)
+    }
 
 @app.post("/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
@@ -659,6 +796,38 @@ def signup(user: User, db: Session = Depends(get_db)):
     db.commit()
     return db_to_user(user_db)
 
+@app.post("/users/{user_id}/coins/increment")
+def increment_user_coins(user_id: str, amount: int = Query(1, ge=1), db: Session = Depends(get_db)):
+    user_db = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        before = int(user_db.coins or 0)
+    except Exception:
+        before = 0
+    after = before + int(amount)
+    user_db.coins = after
+    db.commit()
+    print(f"[coins] increment: user={user_id} +{amount} before={before} after={after}")
+    return {"success": True, "coins": after}
+
+@app.post("/users/{user_id}/coins/decrement")
+def decrement_user_coins(user_id: str, amount: int = Query(1, ge=1), db: Session = Depends(get_db)):
+    user_db = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        before = int(user_db.coins or 0)
+    except Exception:
+        before = 0
+    if before < amount:
+        raise HTTPException(status_code=400, detail=f"Insufficient coins. Current: {before}, required: {amount}")
+    after = before - int(amount)
+    user_db.coins = after
+    db.commit()
+    print(f"[coins] decrement: user={user_id} -{amount} before={before} after={after}")
+    return {"success": True, "coins": after}
+
 @app.post("/forgot-password")
 def forgot_password(email: str):
     return {"success": True, "message": f"If an account exists for {email}, a password reset link has been sent."}
@@ -668,12 +837,17 @@ def update_user(user_id: str, user: User, db: Session = Depends(get_db)):
     user_db = db.query(UserDB).filter(UserDB.id == user_id).first()
     if not user_db:
         raise HTTPException(status_code=404, detail="User not found")
+    try:
+        before_coins = int(user_db.coins or 0)
+    except Exception:
+        before_coins = 0
+
     user_db.name = user.name
     user_db.email = user.email
     user_db.password = user.password
     user_db.avatar = user.avatar
     user_db.isAdmin = user.isAdmin
-    user_db.coins = user.coins
+    # Do NOT set coins from client payload to avoid overwriting server-side balance
     user_db.dailyAttempts = user.dailyAttempts
     user_db.lastAttemptDate = date_parser.parse(user.lastAttemptDate)
     user_db.isBanned = user.isBanned
@@ -683,6 +857,14 @@ def update_user(user_id: str, user: User, db: Session = Depends(get_db)):
     user_db.specializations = json.dumps(user.specializations) if user.specializations else None
     user_db.referralCode = user.referralCode
     user_db.referredBy = user.referredBy
+
+    try:
+        after_coins = int(user_db.coins or 0)
+    except Exception:
+        after_coins = 0
+    if before_coins != after_coins:
+        print(f"[coins] update_user: user={user_id} before={before_coins} after={after_coins}")
+
     db.commit()
     return db_to_user(user_db)
 
@@ -876,11 +1058,17 @@ def save_game_result(game_result: GameResult, db: Session = Depends(get_db)):
     )
     db.add(game_result_db)
     
-    # Update user's coins if coins were won
+    # Update user's coins if coins were won (with logging)
     if game_result.coinsWon > 0:
         user_db = db.query(UserDB).filter(UserDB.id == game_result.user.id).first()
         if user_db:
-            user_db.coins += game_result.coinsWon
+            try:
+                before = int(user_db.coins or 0)
+            except Exception:
+                before = 0
+            after = before + int(game_result.coinsWon)
+            user_db.coins = after
+            print(f"[coins] save_game_result: user={game_result.user.id} coinsWon={game_result.coinsWon} before={before} after={after}")
     
     db.commit()
     return game_result
