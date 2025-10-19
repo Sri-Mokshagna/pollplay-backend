@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, subqueryload, selectinload
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import json
 from dateutil import parser as date_parser
@@ -145,6 +145,24 @@ class SettingsDB(Base):
     __tablename__ = "settings"
     key = Column(String, primary_key=True)
     value = Column(String)
+
+# Chat/E2E models
+class UserPublicKeyDB(Base):
+    __tablename__ = "user_public_keys"
+    user_id = Column(String, ForeignKey('users.id'), primary_key=True)
+    public_jwk = Column(Text)
+    updatedAt = Column(DateTime)
+
+class MessageDB(Base):
+    __tablename__ = "messages"
+    id = Column(String, primary_key=True)
+    sender_id = Column(String, ForeignKey('users.id'))
+    recipient_id = Column(String, ForeignKey('users.id'))
+    ciphertext = Column(Text)
+    iv = Column(String)
+    createdAt = Column(DateTime)
+    delivered = Column(Boolean, default=False)
+    readAt = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -324,6 +342,33 @@ class CoinValueBody(BaseModel):
 class ReferralRewardsBody(BaseModel):
     referrerCoins: int
     refereeCoins: int
+
+# Chat Pydantic models
+class PublicKeyBody(BaseModel):
+    publicKeyJwk: Dict[str, Any]
+
+class SendMessageBody(BaseModel):
+    id: str
+    senderId: str
+    recipientId: str
+    ciphertextBase64: str
+    ivBase64: str
+    createdAt: str
+
+class MessageItem(BaseModel):
+    id: str
+    senderId: str
+    recipientId: str
+    ciphertextBase64: str
+    ivBase64: str
+    createdAt: str
+    delivered: bool
+    readAt: Optional[str] = None
+
+class ConversationItem(BaseModel):
+    peerId: str
+    lastMessageAt: str
+    unreadCount: int
 
 # App
 
@@ -1353,3 +1398,124 @@ def send_push_notification(notification_data: Dict[str, str], db: Session = Depe
         "failed_count": failed_count,
         "total_tokens": len(device_tokens)
     }
+
+# =============================
+# Chat/E2E encryption endpoints
+# =============================
+
+@app.put("/users/{user_id}/public-key")
+def put_public_key(user_id: str, body: PublicKeyBody, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    existing = db.query(UserPublicKeyDB).filter(UserPublicKeyDB.user_id == user_id).first()
+    now = datetime.now(IST)
+    as_text = json.dumps(body.publicKeyJwk)
+    if existing:
+        existing.public_jwk = as_text
+        existing.updatedAt = now
+    else:
+        db.add(UserPublicKeyDB(user_id=user_id, public_jwk=as_text, updatedAt=now))
+    db.commit()
+    return {"success": True}
+
+@app.get("/users/{user_id}/public-key")
+def get_public_key(user_id: str, db: Session = Depends(get_db)):
+    rec = db.query(UserPublicKeyDB).filter(UserPublicKeyDB.user_id == user_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Public key not found")
+    try:
+        jwk = json.loads(rec.public_jwk)
+    except Exception:
+        jwk = rec.public_jwk
+    return {"publicKeyJwk": jwk, "updatedAt": rec.updatedAt.isoformat() if rec.updatedAt else None}
+
+@app.post("/messages")
+def send_message(body: SendMessageBody, db: Session = Depends(get_db)):
+    # Validate users
+    if not db.query(UserDB).filter(UserDB.id == body.senderId).first():
+        raise HTTPException(status_code=404, detail="Sender not found")
+    if not db.query(UserDB).filter(UserDB.id == body.recipientId).first():
+        raise HTTPException(status_code=404, detail="Recipient not found")
+
+    created_at = date_parser.parse(body.createdAt)
+    msg = MessageDB(
+        id=body.id,
+        sender_id=body.senderId,
+        recipient_id=body.recipientId,
+        ciphertext=body.ciphertextBase64,
+        iv=body.ivBase64,
+        createdAt=created_at,
+        delivered=True,
+        readAt=None,
+    )
+    db.add(msg)
+    db.commit()
+    return {"success": True}
+
+@app.get("/conversations/{user_id}", response_model=List[ConversationItem])
+def list_conversations(user_id: str, db: Session = Depends(get_db)):
+    # Fetch peers where user is sender or recipient
+    sent = db.query(MessageDB.recipient_id.label("peer"))\
+        .filter(MessageDB.sender_id == user_id)
+    received = db.query(MessageDB.sender_id.label("peer"))\
+        .filter(MessageDB.recipient_id == user_id)
+
+    peers = set([row.peer for row in sent.union_all(received).all()])
+
+    items: List[ConversationItem] = []
+    for peer in peers:
+        last = db.query(MessageDB).filter(
+            ((MessageDB.sender_id == user_id) & (MessageDB.recipient_id == peer)) |
+            ((MessageDB.sender_id == peer) & (MessageDB.recipient_id == user_id))
+        ).order_by(MessageDB.createdAt.desc()).first()
+        if not last:
+            continue
+        unread = db.query(MessageDB).filter(
+            (MessageDB.recipient_id == user_id) & (MessageDB.sender_id == peer) & (MessageDB.readAt == None)
+        ).count()
+        items.append(ConversationItem(
+            peerId=peer,
+            lastMessageAt=last.createdAt.isoformat(),
+            unreadCount=unread,
+        ))
+    # Sort by lastMessageAt desc
+    items.sort(key=lambda x: x.lastMessageAt, reverse=True)
+    return items
+
+@app.get("/messages/thread", response_model=List[MessageItem])
+def get_thread(userA: str = Query(...), userB: str = Query(...), after: Optional[str] = None, limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+    q = db.query(MessageDB).filter(
+        ((MessageDB.sender_id == userA) & (MessageDB.recipient_id == userB)) |
+        ((MessageDB.sender_id == userB) & (MessageDB.recipient_id == userA))
+    )
+    if after:
+        try:
+            after_dt = date_parser.parse(after)
+            q = q.filter(MessageDB.createdAt > after_dt)
+        except Exception:
+            pass
+    msgs = q.order_by(MessageDB.createdAt.asc()).limit(limit).all()
+    result: List[MessageItem] = []
+    for m in msgs:
+        result.append(MessageItem(
+            id=m.id,
+            senderId=m.sender_id,
+            recipientId=m.recipient_id,
+            ciphertextBase64=m.ciphertext,
+            ivBase64=m.iv,
+            createdAt=m.createdAt.isoformat(),
+            delivered=bool(m.delivered),
+            readAt=m.readAt.isoformat() if m.readAt else None,
+        ))
+    return result
+
+@app.post("/messages/{message_id}/read")
+def mark_message_read(message_id: str, db: Session = Depends(get_db)):
+    m = db.query(MessageDB).filter(MessageDB.id == message_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if not m.readAt:
+        m.readAt = datetime.now(IST)
+        db.commit()
+    return {"success": True, "readAt": m.readAt.isoformat() if m.readAt else None}
