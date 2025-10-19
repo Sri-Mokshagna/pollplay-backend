@@ -1633,8 +1633,16 @@ def upload_voice_message(
         raise HTTPException(status_code=404, detail="Sender not found")
     if not db.query(UserDB).filter(UserDB.id == recipientId).first():
         raise HTTPException(status_code=404, detail="Recipient not found")
-    # Save file
-    safe_name = f"{id}.webm"
+    # Save file with extension based on content type
+    ct = (file.content_type or '').lower()
+    ext = '.webm'
+    if 'mp4' in ct or 'm4a' in ct:
+        ext = '.m4a'
+    elif 'mpeg' in ct or ct.endswith('/mp3'):
+        ext = '.mp3'
+    elif 'ogg' in ct or 'opus' in ct:
+        ext = '.ogg'
+    safe_name = f"{id}{ext}"
     out_path = Path("uploads/voice") / safe_name
     with open(out_path, "wb") as f:
         f.write(file.file.read())
