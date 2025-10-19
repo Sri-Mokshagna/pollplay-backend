@@ -5,3 +5,4 @@ python-dateutil
 firebase-admin
 pytz
 uvicorn
+python-multipart
