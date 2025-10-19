@@ -18,9 +18,8 @@ from pathlib import Path
 # Set IST timezone
 IST = pytz.timezone('Asia/Kolkata')
 
-# Static uploads directory
+# Prepare uploads directory (safe before app creation)
 Path("uploads/voice").mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 DATABASE_URL = "sqlite:///./poll_play.db"
 
@@ -402,6 +401,9 @@ class ConversationItem(BaseModel):
 # App
 
 app = FastAPI()
+
+# Mount uploads static after app is created
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
