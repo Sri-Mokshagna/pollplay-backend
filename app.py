@@ -1,4 +1,5 @@
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, subqueryload, selectinload
@@ -16,6 +17,10 @@ from pathlib import Path
 
 # Set IST timezone
 IST = pytz.timezone('Asia/Kolkata')
+
+# Static uploads directory
+Path("uploads/voice").mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 DATABASE_URL = "sqlite:///./poll_play.db"
 
@@ -38,6 +43,7 @@ class UserDB(Base):
     dailyAttempts = Column(Integer, default=3)
     lastAttemptDate = Column(DateTime)
     isBanned = Column(Boolean, default=False)
+    lastSeen = Column(DateTime, nullable=True)
     mobile = Column(String, nullable=True)
     gender = Column(String, nullable=True)
     bio = Column(Text, nullable=True)
@@ -172,6 +178,8 @@ class MessageDB(Base):
     createdAt = Column(DateTime)
     delivered = Column(Boolean, default=False)
     readAt = Column(DateTime, nullable=True)
+    audioUrl = Column(String, nullable=True)
+    audioDuration = Column(Float, default=0.0)
 
 Base.metadata.create_all(bind=engine)
 
@@ -383,6 +391,8 @@ class MessageItem(BaseModel):
     createdAt: str
     delivered: bool
     readAt: Optional[str] = None
+    audioUrl: Optional[str] = None
+    audioDuration: Optional[float] = None
 
 class ConversationItem(BaseModel):
     peerId: str
@@ -1570,6 +1580,8 @@ def get_thread(userA: str = Query(...), userB: str = Query(...), after: Optional
             createdAt=m.createdAt.isoformat(),
             delivered=bool(m.delivered),
             readAt=m.readAt.isoformat() if m.readAt else None,
+            audioUrl=m.audioUrl,
+            audioDuration=m.audioDuration,
         ))
     return result
 
@@ -1582,3 +1594,63 @@ def mark_message_read(message_id: str, db: Session = Depends(get_db)):
         m.readAt = datetime.now(IST)
         db.commit()
     return {"success": True, "readAt": m.readAt.isoformat() if m.readAt else None}
+
+# Presence endpoints
+@app.post("/presence/ping")
+def presence_ping(user_id: str = Query(...), db: Session = Depends(get_db)):
+    u = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    u.lastSeen = datetime.now(IST)
+    db.commit()
+    return {"success": True}
+
+@app.get("/presence/{user_id}")
+def presence_status(user_id: str, db: Session = Depends(get_db)):
+    u = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    now = datetime.now(IST)
+    online = False
+    if u.lastSeen:
+        online = (now - u.lastSeen) <= timedelta(minutes=2)
+    return {"userId": user_id, "online": online, "lastSeen": u.lastSeen.isoformat() if u.lastSeen else None}
+
+# Voice message upload
+@app.post("/messages/voice")
+def upload_voice_message(
+    id: str = Form(...),
+    senderId: str = Form(...),
+    recipientId: str = Form(...),
+    createdAt: str = Form(...),
+    duration: float = Form(0.0),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    # Validate users
+    sender = db.query(UserDB).filter(UserDB.id == senderId).first()
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender not found")
+    if not db.query(UserDB).filter(UserDB.id == recipientId).first():
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    # Save file
+    safe_name = f"{id}.webm"
+    out_path = Path("uploads/voice") / safe_name
+    with open(out_path, "wb") as f:
+        f.write(file.file.read())
+    # Create message row
+    msg = MessageDB(
+        id=id,
+        sender_id=senderId,
+        recipient_id=recipientId,
+        ciphertext="",  # not used for voice
+        iv="",
+        createdAt=date_parser.parse(createdAt),
+        delivered=True,
+        readAt=None,
+        audioUrl=f"/uploads/voice/{safe_name}",
+        audioDuration=duration,
+    )
+    db.add(msg)
+    db.commit()
+    return {"success": True, "audioUrl": msg.audioUrl, "audioDuration": msg.audioDuration}
