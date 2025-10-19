@@ -146,6 +146,15 @@ class SettingsDB(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
+class AdsStatsDB(Base):
+    __tablename__ = "ads_stats"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey('users.id'))
+    date = Column(String)  # YYYY-MM-DD (IST)
+    watched = Column(Integer, default=0)
+    coins = Column(Integer, default=0)
+    user = relationship("UserDB")
+
 # Chat/E2E models
 class UserPublicKeyDB(Base):
     __tablename__ = "user_public_keys"
@@ -327,6 +336,16 @@ class DeviceToken(BaseModel):
     token: str
     platform: str
     createdAt: str
+
+class AdsStats(BaseModel):
+    userId: str
+    date: str
+    watched: int
+    coins: int
+
+class RewardBody(BaseModel):
+    userId: str
+    amount: int = 5
 
 class LoginRequest(BaseModel):
     email: str
@@ -695,6 +714,50 @@ def delete_category(category_id: str, db: Session = Depends(get_db)):
     return {
         "message": f"Category and {deleted_polls_count} poll(s) deleted successfully"
     }
+
+def today_ist_date_str() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+@app.get("/ads/stats")
+def get_ads_stats(user_id: str = Query(...), db: Session = Depends(get_db)):
+    """Return today's ad stats for a user (IST)."""
+    date_str = today_ist_date_str()
+    row = db.query(AdsStatsDB).filter(AdsStatsDB.user_id == user_id, AdsStatsDB.date == date_str).first()
+    if not row:
+        return {"userId": user_id, "date": date_str, "watched": 0, "coins": 0}
+    return {"userId": user_id, "date": row.date, "watched": row.watched, "coins": row.coins}
+
+@app.post("/ads/reward")
+def post_ads_reward(body: RewardBody, db: Session = Depends(get_db)):
+    """Grant rewarded-ad coins and increment today's watched/coins in a single transaction."""
+    user_db = db.query(UserDB).filter(UserDB.id == body.userId).first()
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    date_str = today_ist_date_str()
+    try:
+        before = int(user_db.coins or 0)
+    except Exception:
+        before = 0
+    grant = max(0, int(body.amount or 0))
+    try:
+        # Update coins
+        user_db.coins = before + grant
+        # Upsert stats
+        row = db.query(AdsStatsDB).filter(AdsStatsDB.user_id == body.userId, AdsStatsDB.date == date_str).first()
+        if not row:
+            row = AdsStatsDB(user_id=body.userId, date=date_str, watched=1 if grant > 0 else 0, coins=grant)
+            db.add(row)
+        else:
+            row.watched = int(row.watched or 0) + (1 if grant > 0 else 0)
+            row.coins = int(row.coins or 0) + grant
+        db.commit()
+        print(f"[ads] reward: user={body.userId} +{grant} before={before} after={user_db.coins} date={date_str}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to grant reward: {e}")
+    # Return updated user and stats
+    row = db.query(AdsStatsDB).filter(AdsStatsDB.user_id == body.userId, AdsStatsDB.date == date_str).first()
+    return {"success": True, "user": db_to_user(user_db), "stats": {"userId": body.userId, "date": date_str, "watched": row.watched, "coins": row.coins}}
 
 @app.get("/users/{user_id}", response_model=User)
 def get_user(user_id: str, db: Session = Depends(get_db)):
