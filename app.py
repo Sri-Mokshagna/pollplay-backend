@@ -1019,9 +1019,18 @@ def presence_status(user_id: str, db: Session = Depends(get_db)):
     online = False
     last_seen_iso = None
     if last is not None:
-        # Both timezone-aware in IST
+        # Normalize legacy naive timestamps to IST to avoid naive/aware subtraction errors
+        try:
+            if last.tzinfo is None:
+                # Localize naive datetime as IST
+                last = IST.localize(last)
+        except Exception:
+            pass
         now = datetime.now(IST)
-        online = (now - last) <= timedelta(seconds=PRESENCE_TTL_SECONDS)
+        try:
+            online = (now - last) <= timedelta(seconds=PRESENCE_TTL_SECONDS)
+        except Exception:
+            online = False
         try:
             last_seen_iso = last.astimezone(IST).isoformat()
         except Exception:
