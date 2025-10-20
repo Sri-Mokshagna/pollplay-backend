@@ -730,6 +730,15 @@ def delete_category(category_id: str, db: Session = Depends(get_db)):
 def today_ist_date_str() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
+# ---- Chat helpers ----
+def iso(dt: datetime | None) -> Optional[str]:
+    if not dt:
+        return None
+    try:
+        return dt.isoformat()
+    except Exception:
+        return None
+
 @app.get("/ads/stats")
 def get_ads_stats(user_id: str = Query(...), db: Session = Depends(get_db)):
     """Return today's ad stats for a user (IST)."""
@@ -770,6 +779,158 @@ def post_ads_reward(body: RewardBody, db: Session = Depends(get_db)):
     # Return updated user and stats
     row = db.query(AdsStatsDB).filter(AdsStatsDB.user_id == body.userId, AdsStatsDB.date == date_str).first()
     return {"success": True, "user": db_to_user(user_db), "stats": {"userId": body.userId, "date": date_str, "watched": row.watched, "coins": row.coins}}
+
+# =============================
+# Conversations (Inbox)
+# =============================
+
+@app.get("/conversations/{user_id}")
+def list_conversations(user_id: str, db: Session = Depends(get_db)):
+    msgs = db.query(MessageDB).filter(
+        (MessageDB.sender_id == user_id) | (MessageDB.recipient_id == user_id)
+    ).all()
+    peers: Dict[str, ConversationItem] = {}
+    for m in msgs:
+        peer = m.recipient_id if m.sender_id == user_id else m.sender_id
+        if peer not in peers:
+            peers[peer] = ConversationItem(peerId=peer, lastMessageAt="1970-01-01T00:00:00Z", unreadCount=0)
+        # update lastMessageAt
+        try:
+            created_iso = m.createdAt.astimezone(IST).isoformat()
+        except Exception:
+            created_iso = iso(m.createdAt) or "1970-01-01T00:00:00Z"
+        if created_iso > peers[peer].lastMessageAt:
+            peers[peer].lastMessageAt = created_iso
+        # unread count (only messages to user and not read)
+        if m.recipient_id == user_id and m.readAt is None:
+            peers[peer].unreadCount += 1
+    # sort by lastMessageAt desc
+    items = list(peers.values())
+    items.sort(key=lambda x: x.lastMessageAt, reverse=True)
+    return items
+
+# =============================
+# Plaintext chat endpoints
+# =============================
+
+class PlainSendBody(BaseModel):
+    id: str
+    senderId: str
+    recipientId: str
+    text: str
+    createdAt: str
+
+@app.post("/messages/plain")
+def send_plain_message(body: PlainSendBody, db: Session = Depends(get_db)):
+    """Store a plaintext message by mapping text into MessageDB.ciphertext."""
+    # Validate users exist (optional but safer)
+    if not db.query(UserDB).filter(UserDB.id == body.senderId).first():
+        raise HTTPException(status_code=404, detail="Sender not found")
+    if not db.query(UserDB).filter(UserDB.id == body.recipientId).first():
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    try:
+        created = date_parser.parse(body.createdAt)
+    except Exception:
+        created = datetime.now(IST)
+    msg = MessageDB(
+        id=body.id,
+        sender_id=body.senderId,
+        recipient_id=body.recipientId,
+        ciphertext=body.text or "",
+        iv="",
+        createdAt=created,
+        delivered=True,
+        readAt=None,
+        audioUrl=None,
+        audioDuration=0.0,
+    )
+    db.add(msg)
+    db.commit()
+    return {"success": True}
+
+@app.get("/messages/thread-plain")
+def get_thread_plain(userA: str = Query(...), userB: str = Query(...), after: Optional[str] = None, limit: int = 50, db: Session = Depends(get_db)):
+    q = db.query(MessageDB).filter(
+        ((MessageDB.sender_id == userA) & (MessageDB.recipient_id == userB)) |
+        ((MessageDB.sender_id == userB) & (MessageDB.recipient_id == userA))
+    )
+    if after:
+        try:
+            after_dt = date_parser.parse(after)
+            q = q.filter(MessageDB.createdAt > after_dt)
+        except Exception:
+            pass
+    msgs = q.order_by(MessageDB.createdAt.asc()).all()
+    if limit and len(msgs) > limit:
+        msgs = msgs[-limit:]
+    out = []
+    for m in msgs:
+        out.append({
+            "id": m.id,
+            "senderId": m.sender_id,
+            "recipientId": m.recipient_id,
+            "text": m.ciphertext or "",
+            "createdAt": iso(m.createdAt) or "",
+            "delivered": bool(m.delivered),
+            "readAt": iso(m.readAt),
+            "audioUrl": m.audioUrl,
+            "audioDuration": m.audioDuration,
+        })
+    return out
+
+@app.post("/messages/{message_id}/read")
+def mark_message_read(message_id: str, db: Session = Depends(get_db)):
+    m = db.query(MessageDB).filter(MessageDB.id == message_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Message not found")
+    m.readAt = datetime.now(IST)
+    db.commit()
+    return {"success": True}
+
+# =============================
+# Voice upload (kept the same contract)
+# =============================
+
+@app.post("/messages/voice")
+def upload_voice(
+    id: Optional[str] = Form(None),
+    senderId: str = Form(...),
+    recipientId: str = Form(...),
+    createdAt: Optional[str] = Form(None),
+    duration: Optional[float] = Form(0.0),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    # Prepare filename and save under uploads/voice
+    msg_id = id or f"voice_{int(time.time()*1000)}"
+    filename = f"{msg_id}.webm"
+    folder = os.path.join("uploads", "voice")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
+    with open(path, "wb") as f:
+        f.write(file.file.read())
+
+    # Create message row
+    try:
+        created = date_parser.parse(createdAt) if createdAt else datetime.now(IST)
+    except Exception:
+        created = datetime.now(IST)
+    rel_url = f"/uploads/voice/{filename}"
+    m = MessageDB(
+        id=msg_id,
+        sender_id=senderId,
+        recipient_id=recipientId,
+        ciphertext="",
+        iv="",
+        createdAt=created,
+        delivered=True,
+        readAt=None,
+        audioUrl=rel_url,
+        audioDuration=float(duration or 0.0),
+    )
+    db.add(m)
+    db.commit()
+    return {"success": True, "audioUrl": rel_url, "audioDuration": float(duration or 0.0)}
 
 @app.get("/users/{user_id}", response_model=User)
 def get_user(user_id: str, db: Session = Depends(get_db)):
@@ -831,6 +992,41 @@ def put_referral_rewards(body: ReferralRewardsBody, db: Session = Depends(get_db
     set_setting(db, "referralReferrerCoins", str(body.referrerCoins))
     set_setting(db, "referralRefereeCoins", str(body.refereeCoins))
     return {"success": True}
+
+# =============================
+# Presence (plaintext chat)
+# =============================
+
+PRESENCE_TTL_SECONDS = 60
+
+@app.post("/presence/ping")
+def presence_ping(user_id: str = Query(...), db: Session = Depends(get_db)):
+    """Mark a user as online by updating lastSeen (IST, timezone-aware)."""
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.lastSeen = datetime.now(IST)
+    db.commit()
+    return {"ok": True}
+
+@app.get("/presence/{user_id}")
+def presence_status(user_id: str, db: Session = Depends(get_db)):
+    """Return online flag based on lastSeen within TTL; provide lastSeen ISO string."""
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    last = user.lastSeen
+    online = False
+    last_seen_iso = None
+    if last is not None:
+        # Both timezone-aware in IST
+        now = datetime.now(IST)
+        online = (now - last) <= timedelta(seconds=PRESENCE_TTL_SECONDS)
+        try:
+            last_seen_iso = last.astimezone(IST).isoformat()
+        except Exception:
+            last_seen_iso = last.isoformat()
+    return {"userId": user_id, "online": online, "lastSeen": last_seen_iso}
 
 @app.post("/referral/apply")
 def apply_referral(body: ApplyReferralBody, db: Session = Depends(get_db)):
