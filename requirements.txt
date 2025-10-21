@@ -6,3 +6,4 @@ firebase-admin
 pytz
 uvicorn
 python-multipart
+psycopg2
