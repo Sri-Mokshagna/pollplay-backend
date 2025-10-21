@@ -1852,26 +1852,6 @@ def mark_message_read(message_id: str, db: Session = Depends(get_db)):
         db.commit()
     return {"success": True, "readAt": m.readAt.isoformat() if m.readAt else None}
 
-# Presence endpoints
-@app.post("/presence/ping")
-def presence_ping(user_id: str = Query(...), db: Session = Depends(get_db)):
-    u = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
-    u.lastSeen = datetime.now(IST)
-    db.commit()
-    return {"success": True}
-
-@app.get("/presence/{user_id}")
-def presence_status(user_id: str, db: Session = Depends(get_db)):
-    u = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
-    now = datetime.now(IST)
-    online = False
-    if u.lastSeen:
-        online = (now - u.lastSeen) <= timedelta(minutes=2)
-    return {"userId": user_id, "online": online, "lastSeen": u.lastSeen.isoformat() if u.lastSeen else None}
 
 # Voice message upload
 @app.post("/messages/voice")
