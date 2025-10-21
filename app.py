@@ -21,7 +21,7 @@ IST = pytz.timezone('Asia/Kolkata')
 # Prepare uploads directory (safe before app creation)
 Path("uploads/voice").mkdir(parents=True, exist_ok=True)
 
-DATABASE_URL = "sqlite:///./poll_play.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./poll_play.db")
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -445,17 +445,37 @@ def db_to_user(user_db):
 def db_to_poll(poll_db, db):
     options = []
     for opt in poll_db.options:
-        votedBy = json.loads(opt.votedBy)
-        options.append(PollOption(id=opt.id, text=opt.text, imageUrl=opt.imageUrl, votes=opt.votes, votedBy=votedBy))
+        # Be resilient to corrupted or null votedBy
+        try:
+            votedBy = json.loads(opt.votedBy or "[]")
+            if not isinstance(votedBy, list):
+                votedBy = []
+        except Exception:
+            votedBy = []
+        options.append(PollOption(id=opt.id, text=opt.text, imageUrl=opt.imageUrl, votes=opt.votes or 0, votedBy=votedBy))
     comments = []
     def build_comments(comment_db):
-        user = CommentUser(id=comment_db.user.id, name=comment_db.user.name, email=comment_db.user.email, avatar=comment_db.user.avatar)
+        # Guard against missing related user records
+        if comment_db.user is None:
+            user = CommentUser(id="unknown", name="Unknown", email="", avatar="")
+        else:
+            user = CommentUser(id=comment_db.user.id, name=comment_db.user.name, email=comment_db.user.email, avatar=comment_db.user.avatar)
+        # Guard timestamp
+        try:
+            ts = comment_db.timestamp.isoformat() if comment_db.timestamp else datetime.now(IST).isoformat()
+        except Exception:
+            ts = datetime.now(IST).isoformat()
         replies = [build_comments(r) for r in db.query(CommentDB).filter(CommentDB.parent_id == comment_db.id).all()]
-        return Comment(id=comment_db.id, user=user, text=comment_db.text, audio_url=comment_db.audio_url, timestamp=comment_db.timestamp.isoformat(), likes=comment_db.likes, replies=replies, flaggedForReview=comment_db.flaggedForReview, reviewReason=comment_db.reviewReason)
+        return Comment(id=comment_db.id, user=user, text=comment_db.text, audio_url=comment_db.audio_url, timestamp=ts, likes=comment_db.likes or 0, replies=replies, flaggedForReview=comment_db.flaggedForReview, reviewReason=comment_db.reviewReason)
     top_comments = db.query(CommentDB).filter(CommentDB.poll_id == poll_db.id, CommentDB.parent_id == None).all()
     for c in top_comments:
         comments.append(build_comments(c))
-    return Poll(id=poll_db.id, title=poll_db.title, description=poll_db.description, category=poll_db.category, thumbnail=poll_db.thumbnail, options=options, comments=comments, createdAt=poll_db.createdAt.isoformat(), disableVoiceComments=poll_db.disableVoiceComments)
+    # Safely handle missing createdAt
+    try:
+        created_at_str = poll_db.createdAt.isoformat() if poll_db.createdAt else datetime.now(IST).isoformat()
+    except Exception:
+        created_at_str = datetime.now(IST).isoformat()
+    return Poll(id=poll_db.id, title=poll_db.title, description=poll_db.description, category=poll_db.category, thumbnail=poll_db.thumbnail, options=options, comments=comments, createdAt=created_at_str, disableVoiceComments=poll_db.disableVoiceComments)
 
 # Endpoints
 
@@ -529,10 +549,15 @@ def add_poll(poll: Poll, db: Session = Depends(get_db)):
     poll_db = PollDB(id=poll.id, title=poll.title, description=poll.description, category=poll.category, thumbnail=poll.thumbnail, createdAt=date_parser.parse(poll.createdAt), disableVoiceComments=poll.disableVoiceComments)
     db.add(poll_db)
     for opt in poll.options:
-        opt_db = PollOptionDB(id=opt.id, poll_id=poll.id, text=opt.text, imageUrl=opt.imageUrl, votes=opt.votes, votedBy=json.dumps(opt.votedBy))
+        opt_db = PollOptionDB(id=opt.id, poll_id=poll.id, text=opt.text, imageUrl=opt.imageUrl, votes=opt.votes or 0, votedBy=json.dumps(opt.votedBy or []))
         db.add(opt_db)
-    db.commit()
-    return poll
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create poll: {e}")
+    # Return canonical representation from DB
+    return db_to_poll(poll_db, db)
 
 @app.put("/polls/{poll_id}", response_model=Poll)
 def update_poll(poll_id: str, poll: Poll, db: Session = Depends(get_db)):
@@ -681,6 +706,12 @@ def add_category(category: Category, db: Session = Depends(get_db)):
     db.commit()
     return category
 
+# List categories (used by admin UI)
+@app.get("/categories", response_model=List[Category])
+def list_categories(db: Session = Depends(get_db)):
+    rows = db.query(CategoryDB).all()
+    return [Category(id=r.id, name=r.name) for r in rows]
+
 @app.delete("/categories/{category_id}")
 def delete_category(category_id: str, db: Session = Depends(get_db)):
     """Delete a category by ID and all polls within it"""
@@ -732,10 +763,16 @@ def today_ist_date_str() -> str:
 
 # ---- Chat helpers ----
 def iso(dt: datetime | None) -> Optional[str]:
+    """Return UTC ISO8601 with Z. Localize naive datetimes as IST first."""
     if not dt:
         return None
     try:
-        return dt.isoformat()
+        if dt.tzinfo is None:
+            dt = IST.localize(dt)
+        # convert to UTC and return with trailing Z
+        import pytz as _p
+        s = dt.astimezone(_p.utc).isoformat()
+        return s.replace("+00:00", "Z")
     except Exception:
         return None
 
