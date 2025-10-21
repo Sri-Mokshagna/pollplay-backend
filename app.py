@@ -23,7 +23,20 @@ Path("uploads/voice").mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./poll_play.db")
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Normalize Postgres URL for SQLAlchemy and set engine connect args per dialect
+normalized_url = DATABASE_URL
+try:
+    if DATABASE_URL.startswith("postgres://"):
+        normalized_url = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif DATABASE_URL.startswith("postgresql://") and "+" not in DATABASE_URL:
+        normalized_url = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+except Exception:
+    normalized_url = DATABASE_URL
+
+if normalized_url.startswith("sqlite"):
+    engine = create_engine(normalized_url, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(normalized_url)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
