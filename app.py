@@ -526,29 +526,40 @@ def get_polls(db: Session = Depends(get_db)):
         polls.append(db_to_poll(p, db))
     return polls
 
-# Trending polls for a particular day (default: today, IST)
+# Trending polls (all-time): sorted by engagement (votes + comments)
 @app.get("/trending", response_model=List[Poll])
-def get_trending(date: Optional[str] = None, db: Session = Depends(get_db)):
-    # date in format YYYY-MM-DD; default to today in IST
-    if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
-    else:
-        target_date = datetime.now(IST).date()
-
+def get_trending(db: Session = Depends(get_db)):
     polls_db = db.query(PollDB).all()
-    todays = []
-    for p in polls_db:
-        if not p.createdAt:
-            continue
-        if p.createdAt.astimezone(IST).date() == target_date:
-            todays.append(p)
 
-    # Sort by total votes desc
-    todays.sort(key=lambda poll: sum(opt.votes or 0 for opt in poll.options), reverse=True)
-    return [db_to_poll(p, db) for p in todays]
+    # Precompute comment counts for each poll id efficiently
+    # (simple approach: count per poll; acceptable for moderate datasets)
+    engagement_list = []
+    for p in polls_db:
+        try:
+            total_votes = sum((opt.votes or 0) for opt in p.options)
+        except Exception:
+            total_votes = 0
+        try:
+            comments_count = db.query(CommentDB).filter(CommentDB.poll_id == p.id).count()
+        except Exception:
+            comments_count = 0
+        engagement = (total_votes or 0) + (comments_count or 0)
+        engagement_list.append((p, engagement))
+
+    # Sort by engagement desc, then by createdAt desc as tiebreaker
+    def sort_key(item):
+        poll, engagement = item
+        created = None
+        try:
+            created = poll.createdAt
+        except Exception:
+            created = None
+        return (engagement, created or datetime.min)
+
+    engagement_list.sort(key=sort_key, reverse=True)
+
+    # Return all polls sorted by engagement
+    return [db_to_poll(p, db) for (p, _) in engagement_list]
 
 @app.get("/polls/{poll_id}", response_model=Poll)
 def get_poll(poll_id: str, db: Session = Depends(get_db)):
