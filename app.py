@@ -1058,17 +1058,30 @@ def put_referral_rewards(body: ReferralRewardsBody, db: Session = Depends(get_db
 # Presence (plaintext chat)
 # =============================
 
-PRESENCE_TTL_SECONDS = 60
+PRESENCE_TTL_SECONDS = 120
 
 @app.post("/presence/ping")
-def presence_ping(user_id: str = Query(...), db: Session = Depends(get_db)):
-    """Mark a user as online by updating lastSeen (IST, timezone-aware)."""
-    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+def presence_ping(
+    user_id: Optional[str] = Query(None),
+    body: Optional[dict] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Mark a user as online by updating lastSeen (IST, timezone-aware).
+    Accepts either query param ?user_id=... or JSON body { "userId": "..." } for flexibility.
+    """
+    uid = user_id or (body.get("userId") if isinstance(body, dict) else None)
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    user = db.query(UserDB).filter(UserDB.id == uid).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.lastSeen = datetime.now(IST)
     db.commit()
-    return {"ok": True}
+    try:
+        last_seen_iso = user.lastSeen.astimezone(IST).isoformat()
+    except Exception:
+        last_seen_iso = user.lastSeen.isoformat()
+    return {"ok": True, "userId": uid, "lastSeen": last_seen_iso}
 
 @app.get("/presence/{user_id}")
 def presence_status(user_id: str, db: Session = Depends(get_db)):
@@ -1097,6 +1110,30 @@ def presence_status(user_id: str, db: Session = Depends(get_db)):
         except Exception:
             last_seen_iso = last.isoformat()
     return {"userId": user_id, "online": online, "lastSeen": last_seen_iso}
+
+@app.post("/presence/offline")
+def presence_offline(
+    user_id: Optional[str] = Query(None),
+    body: Optional[dict] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Force-mark a user as offline immediately by backdating lastSeen beyond TTL.
+    Accepts either ?user_id=... or JSON { "userId": "..." }.
+    """
+    uid = user_id or (body.get("userId") if isinstance(body, dict) else None)
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    user = db.query(UserDB).filter(UserDB.id == uid).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Backdate beyond TTL to ensure presence reads as offline immediately
+    user.lastSeen = datetime.now(IST) - timedelta(seconds=PRESENCE_TTL_SECONDS * 2)
+    db.commit()
+    try:
+        last_seen_iso = user.lastSeen.astimezone(IST).isoformat()
+    except Exception:
+        last_seen_iso = user.lastSeen.isoformat()
+    return {"ok": True, "userId": uid, "lastSeen": last_seen_iso}
 
 @app.post("/referral/apply")
 def apply_referral(body: ApplyReferralBody, db: Session = Depends(get_db)):
