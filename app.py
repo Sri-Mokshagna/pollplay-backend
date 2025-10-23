@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, subqueryload, selectinload
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
@@ -1058,7 +1059,7 @@ def put_referral_rewards(body: ReferralRewardsBody, db: Session = Depends(get_db
 # Presence (plaintext chat)
 # =============================
 
-PRESENCE_TTL_SECONDS = 120
+PRESENCE_TTL_SECONDS = 300
 
 @app.post("/presence/ping")
 def presence_ping(
@@ -1540,16 +1541,63 @@ def get_user_today_game_count(user_id: str, db: Session = Depends(get_db)):
 
 @app.post("/device-tokens", response_model=DeviceToken)
 def store_device_token(token_data: DeviceToken, db: Session = Depends(get_db)):
-    # Check if token already exists
+    """Idempotent register/update of a device token.
+    - If token exists, update user/platform and return existing.
+    - If not, insert. If a race causes IntegrityError, fetch and return existing.
+    """
     existing = db.query(DeviceTokenDB).filter(DeviceTokenDB.token == token_data.token).first()
     if existing:
-        # Update if user changed or something, but for now just return
-        return DeviceToken(id=existing.id, user_id=existing.user_id, token=existing.token, platform=existing.platform, createdAt=existing.createdAt.isoformat())
-    
-    token_db = DeviceTokenDB(id=token_data.id, user_id=token_data.user_id, token=token_data.token, platform=token_data.platform, createdAt=date_parser.parse(token_data.createdAt))
+        changed = False
+        if token_data.user_id and existing.user_id != token_data.user_id:
+            existing.user_id = token_data.user_id
+            changed = True
+        if token_data.platform and existing.platform != token_data.platform:
+            existing.platform = token_data.platform
+            changed = True
+        if changed:
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+        return DeviceToken(
+            id=existing.id,
+            user_id=existing.user_id,
+            token=existing.token,
+            platform=existing.platform,
+            createdAt=(existing.createdAt.astimezone(IST).isoformat() if hasattr(existing.createdAt, 'astimezone') and existing.createdAt.tzinfo else existing.createdAt.isoformat() if existing.createdAt else datetime.now(IST).isoformat())
+        )
+
+    token_db = DeviceTokenDB(
+        id=token_data.id,
+        user_id=token_data.user_id,
+        token=token_data.token,
+        platform=token_data.platform,
+        createdAt=date_parser.parse(token_data.createdAt) if token_data.createdAt else datetime.now(IST)
+    )
     db.add(token_db)
-    db.commit()
-    return token_data
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Token was inserted concurrently; fetch and return it
+        existing2 = db.query(DeviceTokenDB).filter(DeviceTokenDB.token == token_data.token).first()
+        if existing2:
+            return DeviceToken(
+                id=existing2.id,
+                user_id=existing2.user_id,
+                token=existing2.token,
+                platform=existing2.platform,
+                createdAt=(existing2.createdAt.astimezone(IST).isoformat() if hasattr(existing2.createdAt, 'astimezone') and existing2.createdAt.tzinfo else existing2.createdAt.isoformat() if existing2.createdAt else datetime.now(IST).isoformat())
+            )
+        # Unexpected: re-raise
+        raise
+    return DeviceToken(
+        id=token_db.id,
+        user_id=token_db.user_id,
+        token=token_db.token,
+        platform=token_db.platform,
+        createdAt=(token_db.createdAt.astimezone(IST).isoformat() if hasattr(token_db.createdAt, 'astimezone') and token_db.createdAt.tzinfo else token_db.createdAt.isoformat() if token_db.createdAt else datetime.now(IST).isoformat())
+    )
 
 @app.get("/analytics/polls")
 def get_poll_analytics(db: Session = Depends(get_db)):
