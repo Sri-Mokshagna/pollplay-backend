@@ -1093,11 +1093,11 @@ def presence_status(user_id: str, db: Session = Depends(get_db)):
     online = False
     last_seen_iso = None
     if last is not None:
-        # Normalize legacy naive timestamps to IST to avoid naive/aware subtraction errors
+        # Normalize legacy naive timestamps. Treat as UTC then convert to IST to avoid 5.5h skew.
         try:
             if last.tzinfo is None:
-                # Localize naive datetime as IST
-                last = IST.localize(last)
+                # Assume stored as UTC (legacy) and convert to IST
+                last = pytz.utc.localize(last).astimezone(IST)
         except Exception:
             pass
         now = datetime.now(IST)
