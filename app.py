@@ -1425,8 +1425,8 @@ def update_redemption_request_status(request_id: str, request_data: Dict[str, st
     new_status = request_data.get("status", request_db.status)
     old_status = request_db.status
 
-    # If status is being changed to "processed" and it wasn't already processed, deduct coins
-    if new_status == "processed" and old_status != "processed":
+    # If status is being changed to "approved" or "processed" and coins haven't been deducted yet, deduct coins
+    if new_status in ["approved", "processed"] and old_status not in ["approved", "processed"]:
         user_db = db.query(UserDB).filter(UserDB.id == request_db.user_id).first()
         if not user_db:
             raise HTTPException(status_code=404, detail="User account not found")
@@ -1437,13 +1437,15 @@ def update_redemption_request_status(request_id: str, request_data: Dict[str, st
 
         # Deduct coins from user's account
         user_db.coins -= request_db.amount
+        print(f"[redemption] Deducted {request_db.amount} coins from user {user_db.id}. New balance: {user_db.coins}")
 
-    # If status is being changed from "processed" to something else, refund coins
-    elif old_status == "processed" and new_status != "processed":
+    # If status is being changed from "approved" or "processed" to "pending" or "rejected", refund coins
+    elif old_status in ["approved", "processed"] and new_status not in ["approved", "processed"]:
         user_db = db.query(UserDB).filter(UserDB.id == request_db.user_id).first()
         if user_db:
             # Refund coins to user's account
             user_db.coins += request_db.amount
+            print(f"[redemption] Refunded {request_db.amount} coins to user {user_db.id}. New balance: {user_db.coins}")
 
     request_db.status = new_status
     request_db.adminNotes = request_data.get("adminNotes", request_db.adminNotes)
