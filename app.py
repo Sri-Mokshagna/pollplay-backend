@@ -1370,7 +1370,10 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     # For non-admin users, generate and send OTP
     print(f"[LOGIN] Generating OTP for non-admin user: {user_db.email}")
     otp_code = generate_otp()
-    expires_at = datetime.now(IST) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    
+    # Use UTC for consistent timezone handling across database
+    now_utc = datetime.now(pytz.UTC)
+    expires_at = now_utc + timedelta(minutes=OTP_EXPIRY_MINUTES)
     
     # Store OTP in database
     otp_db = OTPDB(
@@ -1382,6 +1385,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     db.add(otp_db)
     db.commit()
     print(f"[LOGIN] OTP stored in database for: {user_db.email}")
+    print(f"[LOGIN] OTP expires at: {expires_at} (UTC), valid for {OTP_EXPIRY_MINUTES} minutes")
     
     # Send OTP via email
     email_sent = send_otp_email(user_db.email, otp_code)
@@ -1417,16 +1421,22 @@ def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
         print(f"[VERIFY-OTP] Invalid OTP for: {request.email}")
         return {"success": False, "message": "Invalid OTP"}
     
-    # Check if OTP has expired
-    now = datetime.now(IST)
+    # Check if OTP has expired - use UTC consistently
+    now_utc = datetime.now(pytz.UTC)
     expires_at = otp_db.expires_at
     
-    # Handle timezone-naive datetime from database (PostgreSQL might return naive)
+    # Handle timezone-naive datetime from database
     if expires_at.tzinfo is None:
-        expires_at = IST.localize(expires_at)
+        # Assume database stores UTC time
+        expires_at = pytz.UTC.localize(expires_at)
     
-    if now > expires_at:
-        print(f"[VERIFY-OTP] Expired OTP for: {request.email}")
+    # Debug logging
+    print(f"[VERIFY-OTP] Current time (UTC): {now_utc}")
+    print(f"[VERIFY-OTP] OTP expires at (UTC): {expires_at}")
+    print(f"[VERIFY-OTP] Time difference: {(expires_at - now_utc).total_seconds()} seconds")
+    
+    if now_utc > expires_at:
+        print(f"[VERIFY-OTP] ✗ Expired OTP for: {request.email}")
         return {"success": False, "message": "OTP has expired. Please request a new one."}
     
     # Mark OTP as used
@@ -1461,7 +1471,10 @@ def resend_otp(request: dict, db: Session = Depends(get_db)):
     
     # Generate new OTP
     otp_code = generate_otp()
-    expires_at = datetime.now(IST) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    
+    # Use UTC for consistent timezone handling
+    now_utc = datetime.now(pytz.UTC)
+    expires_at = now_utc + timedelta(minutes=OTP_EXPIRY_MINUTES)
     
     # Store OTP in database
     otp_db = OTPDB(
@@ -1472,6 +1485,7 @@ def resend_otp(request: dict, db: Session = Depends(get_db)):
     )
     db.add(otp_db)
     db.commit()
+    print(f"[RESEND-OTP] New OTP generated for: {email}, expires at: {expires_at} (UTC)")
     
     # Send OTP via email
     email_sent = send_otp_email(email, otp_code)
