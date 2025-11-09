@@ -1,6 +1,6 @@
 from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, File, Form, Body
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, subqueryload, selectinload
 from sqlalchemy.exc import IntegrityError
@@ -210,6 +210,67 @@ class MessageDB(Base):
     audioDuration = Column(Float, default=0.0)
 
 Base.metadata.create_all(bind=engine)
+
+# Database Migration: Add missing columns if they don't exist
+def migrate_database():
+    """Add new columns to existing tables without using Alembic"""
+    db = SessionLocal()
+    try:
+        # Check if we're using PostgreSQL or SQLite
+        is_postgres = 'postgresql' in str(engine.url)
+        
+        # Migration 1: Add successfulRedemptions column to users table
+        try:
+            db.execute(text("SELECT \"successfulRedemptions\" FROM users LIMIT 1"))
+            print("[MIGRATION] successfulRedemptions column already exists")
+        except Exception:
+            print("[MIGRATION] Adding successfulRedemptions column to users table...")
+            if is_postgres:
+                db.execute(text("ALTER TABLE users ADD COLUMN \"successfulRedemptions\" INTEGER DEFAULT 0"))
+            else:
+                db.execute(text("ALTER TABLE users ADD COLUMN successfulRedemptions INTEGER DEFAULT 0"))
+            db.commit()
+            print("[MIGRATION] successfulRedemptions column added successfully")
+        
+        # Migration 2: Create otps table if it doesn't exist
+        try:
+            db.execute(text("SELECT * FROM otps LIMIT 1"))
+            print("[MIGRATION] otps table already exists")
+        except Exception:
+            print("[MIGRATION] Creating otps table...")
+            if is_postgres:
+                db.execute(text("""
+                    CREATE TABLE otps (
+                        id SERIAL PRIMARY KEY,
+                        email VARCHAR,
+                        otp_code VARCHAR,
+                        created_at TIMESTAMP WITH TIME ZONE,
+                        expires_at TIMESTAMP WITH TIME ZONE,
+                        is_used BOOLEAN DEFAULT FALSE
+                    )
+                """))
+            else:
+                db.execute(text("""
+                    CREATE TABLE otps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email VARCHAR,
+                        otp_code VARCHAR,
+                        created_at DATETIME,
+                        expires_at DATETIME,
+                        is_used BOOLEAN DEFAULT 0
+                    )
+                """))
+            db.commit()
+            print("[MIGRATION] otps table created successfully")
+            
+    except Exception as e:
+        print(f"[MIGRATION] Error during migration: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+# Run migrations
+migrate_database()
 
 # Initialize Firebase Admin SDK
 try:
@@ -1273,18 +1334,27 @@ def apply_referral(body: ApplyReferralBody, db: Session = Depends(get_db)):
 
 @app.post("/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
+    print(f"[LOGIN] Login attempt for email: {request.email}")
+    
     # Validate email and password
     user_db = db.query(UserDB).filter(UserDB.email == request.email, UserDB.password == request.password).first()
     if not user_db:
+        print(f"[LOGIN] Invalid credentials for: {request.email}")
         return {"success": False, "message": "Invalid email or password"}
+    
     if user_db.isBanned:
+        print(f"[LOGIN] Banned user attempted login: {request.email}")
         return {"success": False, "message": "This account has been banned."}
+    
+    print(f"[LOGIN] User found: {user_db.email}, isAdmin: {user_db.isAdmin}")
     
     # Admin users login directly without OTP
     if user_db.isAdmin:
+        print(f"[LOGIN] Admin login successful: {user_db.email}")
         return {"success": True, "user": db_to_user(user_db), "requiresOTP": False}
     
     # For non-admin users, generate and send OTP
+    print(f"[LOGIN] Generating OTP for non-admin user: {user_db.email}")
     otp_code = generate_otp()
     expires_at = datetime.now(IST) + timedelta(minutes=OTP_EXPIRY_MINUTES)
     
@@ -1297,12 +1367,16 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     )
     db.add(otp_db)
     db.commit()
+    print(f"[LOGIN] OTP stored in database for: {user_db.email}")
     
     # Send OTP via email
     email_sent = send_otp_email(user_db.email, otp_code)
     
-    if not email_sent:
+    if email_sent:
+        print(f"[LOGIN] OTP email sent successfully to: {user_db.email}")
+    else:
         print(f"[LOGIN] OTP generated but email not sent (check SMTP config): {otp_code}")
+        print(f"[LOGIN] SMTP Config - Server: {SMTP_SERVER}, Port: {SMTP_PORT}, Username: {SMTP_USERNAME}")
     
     return {
         "success": True, 
@@ -1389,26 +1463,31 @@ def signup(user: User, db: Session = Depends(get_db)):
     existing = db.query(UserDB).filter(UserDB.email == user.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
+    
+    # SECURITY: Force isAdmin=False for all new signups
+    # Only existing admins can promote users to admin via the admin panel
     user_db = UserDB(
         id=user.id,
         name=user.name,
         email=user.email,
         password=user.password,
         avatar=user.avatar,
-        isAdmin=user.isAdmin,
+        isAdmin=False,  # Always False for new signups
         coins=user.coins,
         dailyAttempts=user.dailyAttempts,
         lastAttemptDate=date_parser.parse(user.lastAttemptDate),
-        isBanned=user.isBanned,
+        isBanned=False,  # Always False for new signups
         mobile=user.mobile,
         gender=user.gender,
         bio=user.bio,
         specializations=json.dumps(user.specializations) if user.specializations else None,
         referralCode=user.referralCode,
         referredBy=user.referredBy,
+        successfulRedemptions=0,  # Initialize redemption count
     )
     db.add(user_db)
     db.commit()
+    print(f"[SIGNUP] New user created: {user.email} (isAdmin=False)")
     return db_to_user(user_db)
 
 @app.post("/users/{user_id}/coins/increment")
