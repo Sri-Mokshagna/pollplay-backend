@@ -222,49 +222,63 @@ def migrate_database():
         # Migration 1: Add successfulRedemptions column to users table
         try:
             db.execute(text("SELECT \"successfulRedemptions\" FROM users LIMIT 1"))
+            db.commit()  # Commit successful check
             print("[MIGRATION] successfulRedemptions column already exists")
-        except Exception:
-            print("[MIGRATION] Adding successfulRedemptions column to users table...")
-            if is_postgres:
-                db.execute(text("ALTER TABLE users ADD COLUMN \"successfulRedemptions\" INTEGER DEFAULT 0"))
-            else:
-                db.execute(text("ALTER TABLE users ADD COLUMN successfulRedemptions INTEGER DEFAULT 0"))
-            db.commit()
-            print("[MIGRATION] successfulRedemptions column added successfully")
+        except Exception as e:
+            # CRITICAL: Rollback failed transaction before attempting ALTER
+            db.rollback()
+            print(f"[MIGRATION] Column not found, adding it... ({type(e).__name__})")
+            try:
+                if is_postgres:
+                    db.execute(text("ALTER TABLE users ADD COLUMN \"successfulRedemptions\" INTEGER DEFAULT 0"))
+                else:
+                    db.execute(text("ALTER TABLE users ADD COLUMN successfulRedemptions INTEGER DEFAULT 0"))
+                db.commit()
+                print("[MIGRATION] ✓ successfulRedemptions column added successfully")
+            except Exception as e2:
+                print(f"[MIGRATION] ✗ Failed to add column: {e2}")
+                db.rollback()
         
         # Migration 2: Create otps table if it doesn't exist
         try:
             db.execute(text("SELECT * FROM otps LIMIT 1"))
+            db.commit()  # Commit successful check
             print("[MIGRATION] otps table already exists")
-        except Exception:
-            print("[MIGRATION] Creating otps table...")
-            if is_postgres:
-                db.execute(text("""
-                    CREATE TABLE otps (
-                        id SERIAL PRIMARY KEY,
-                        email VARCHAR,
-                        otp_code VARCHAR,
-                        created_at TIMESTAMP WITH TIME ZONE,
-                        expires_at TIMESTAMP WITH TIME ZONE,
-                        is_used BOOLEAN DEFAULT FALSE
-                    )
-                """))
-            else:
-                db.execute(text("""
-                    CREATE TABLE otps (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        email VARCHAR,
-                        otp_code VARCHAR,
-                        created_at DATETIME,
-                        expires_at DATETIME,
-                        is_used BOOLEAN DEFAULT 0
-                    )
-                """))
-            db.commit()
-            print("[MIGRATION] otps table created successfully")
+        except Exception as e:
+            # CRITICAL: Rollback failed transaction before attempting CREATE
+            db.rollback()
+            print(f"[MIGRATION] Table not found, creating it... ({type(e).__name__})")
+            try:
+                if is_postgres:
+                    db.execute(text("""
+                        CREATE TABLE otps (
+                            id SERIAL PRIMARY KEY,
+                            email VARCHAR,
+                            otp_code VARCHAR,
+                            created_at TIMESTAMP WITH TIME ZONE,
+                            expires_at TIMESTAMP WITH TIME ZONE,
+                            is_used BOOLEAN DEFAULT FALSE
+                        )
+                    """))
+                else:
+                    db.execute(text("""
+                        CREATE TABLE otps (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            email VARCHAR,
+                            otp_code VARCHAR,
+                            created_at DATETIME,
+                            expires_at DATETIME,
+                            is_used BOOLEAN DEFAULT 0
+                        )
+                    """))
+                db.commit()
+                print("[MIGRATION] ✓ otps table created successfully")
+            except Exception as e2:
+                print(f"[MIGRATION] ✗ Failed to create table: {e2}")
+                db.rollback()
             
     except Exception as e:
-        print(f"[MIGRATION] Error during migration: {e}")
+        print(f"[MIGRATION] ✗ Unexpected error during migration: {e}")
         db.rollback()
     finally:
         db.close()
