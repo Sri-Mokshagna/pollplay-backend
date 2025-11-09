@@ -39,9 +39,12 @@ def migrate():
                 db.execute(text('SELECT "successfulRedemptions" FROM users LIMIT 1'))
             else:
                 db.execute(text('SELECT successfulRedemptions FROM users LIMIT 1'))
+            db.commit()  # Commit successful check
             print("[MIGRATE] ✓ successfulRedemptions column already exists")
         except Exception as e:
-            print(f"[MIGRATE] Column not found, adding it... ({e})")
+            # CRITICAL: Rollback failed transaction before attempting ALTER
+            db.rollback()
+            print(f"[MIGRATE] Column not found, adding it... ({type(e).__name__})")
             try:
                 if is_postgres:
                     db.execute(text('ALTER TABLE users ADD COLUMN "successfulRedemptions" INTEGER DEFAULT 0'))
@@ -57,9 +60,12 @@ def migrate():
         print("\n[MIGRATE] Checking otps table...")
         try:
             db.execute(text("SELECT * FROM otps LIMIT 1"))
+            db.commit()  # Commit successful check
             print("[MIGRATE] ✓ otps table already exists")
         except Exception as e:
-            print(f"[MIGRATE] Table not found, creating it... ({e})")
+            # CRITICAL: Rollback failed transaction before attempting CREATE
+            db.rollback()
+            print(f"[MIGRATE] Table not found, creating it... ({type(e).__name__})")
             try:
                 if is_postgres:
                     db.execute(text("""
