@@ -15,6 +15,11 @@ from firebase_admin import credentials, messaging
 import pytz
 import os
 from pathlib import Path
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import random
+import string
 
 # Set IST timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -63,6 +68,16 @@ class UserDB(Base):
     specializations = Column(Text, nullable=True)
     referralCode = Column(String, unique=True, nullable=True)
     referredBy = Column(String, nullable=True)
+    successfulRedemptions = Column(Integer, default=0)
+
+class OTPDB(Base):
+    __tablename__ = "otps"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String, index=True)
+    otp_code = Column(String)
+    created_at = Column(DateTime, default=lambda: datetime.now(IST))
+    expires_at = Column(DateTime)
+    is_used = Column(Boolean, default=False)
 
 class CategoryDB(Base):
     __tablename__ = "categories"
@@ -274,6 +289,7 @@ class User(BaseModel):
     specializations: Optional[List[str]] = None
     referralCode: Optional[str] = None
     referredBy: Optional[str] = None
+    successfulRedemptions: int = 0
 
 class CommentUser(BaseModel):
     id: str
@@ -372,6 +388,10 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp: str
+
 class ApplyReferralBody(BaseModel):
     referralCode: str
     joinerUserId: str
@@ -434,7 +454,73 @@ def get_db():
     finally:
         db.close()
 
-# Helper
+# Email Configuration
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", SMTP_USERNAME)
+OTP_EXPIRY_MINUTES = 10
+
+# Helper Functions
+
+def generate_otp(length=6):
+    """Generate a random OTP code"""
+    return ''.join(random.choices(string.digits, k=length))
+
+def send_otp_email(recipient_email: str, otp_code: str):
+    """Send OTP via email"""
+    try:
+        if not SMTP_USERNAME or not SMTP_PASSWORD:
+            print("[EMAIL] SMTP credentials not configured")
+            return False
+        
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = 'Your PolliFy Login OTP'
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient_email
+        
+        # Create HTML email body
+        html = f"""
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+              <h2 style="color: #4F46E5; margin-bottom: 20px;">PolliFy Login Verification</h2>
+              <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
+                Your One-Time Password (OTP) for login is:
+              </p>
+              <div style="background-color: #F3F4F6; padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 20px;">
+                <h1 style="color: #4F46E5; font-size: 36px; letter-spacing: 8px; margin: 0;">{otp_code}</h1>
+              </div>
+              <p style="font-size: 14px; color: #666; margin-bottom: 10px;">
+                This OTP is valid for {OTP_EXPIRY_MINUTES} minutes.
+              </p>
+              <p style="font-size: 14px; color: #666; margin-bottom: 20px;">
+                If you didn't request this OTP, please ignore this email.
+              </p>
+              <hr style="border: none; border-top: 1px solid #E5E7EB; margin: 20px 0;">
+              <p style="font-size: 12px; color: #999; text-align: center;">
+                This is an automated message from PolliFy. Please do not reply to this email.
+              </p>
+            </div>
+          </body>
+        </html>
+        """
+        
+        part = MIMEText(html, 'html')
+        msg.attach(part)
+        
+        # Send email
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        
+        print(f"[EMAIL] OTP sent successfully to {recipient_email}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL] Failed to send OTP: {e}")
+        return False
 
 def db_to_user(user_db):
     return User(
@@ -454,6 +540,7 @@ def db_to_user(user_db):
         specializations=json.loads(user_db.specializations) if user_db.specializations else None,
         referralCode=user_db.referralCode,
         referredBy=user_db.referredBy,
+        successfulRedemptions=user_db.successfulRedemptions or 0,
     )
 
 def db_to_poll(poll_db, db):
@@ -1186,12 +1273,116 @@ def apply_referral(body: ApplyReferralBody, db: Session = Depends(get_db)):
 
 @app.post("/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
+    # Validate email and password
     user_db = db.query(UserDB).filter(UserDB.email == request.email, UserDB.password == request.password).first()
     if not user_db:
         return {"success": False, "message": "Invalid email or password"}
     if user_db.isBanned:
         return {"success": False, "message": "This account has been banned."}
+    
+    # Admin users login directly without OTP
+    if user_db.isAdmin:
+        return {"success": True, "user": db_to_user(user_db), "requiresOTP": False}
+    
+    # For non-admin users, generate and send OTP
+    otp_code = generate_otp()
+    expires_at = datetime.now(IST) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    
+    # Store OTP in database
+    otp_db = OTPDB(
+        email=user_db.email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+        is_used=False
+    )
+    db.add(otp_db)
+    db.commit()
+    
+    # Send OTP via email
+    email_sent = send_otp_email(user_db.email, otp_code)
+    
+    if not email_sent:
+        print(f"[LOGIN] OTP generated but email not sent (check SMTP config): {otp_code}")
+    
+    return {
+        "success": True, 
+        "requiresOTP": True,
+        "message": "OTP sent to your email",
+        "email": user_db.email,
+        # For development/testing - remove in production
+        "otp_hint": otp_code if not email_sent else None
+    }
+
+@app.post("/verify-otp")
+def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+    """Verify OTP and complete login for non-admin users"""
+    # Find the most recent unused OTP for this email
+    otp_db = db.query(OTPDB).filter(
+        OTPDB.email == request.email,
+        OTPDB.otp_code == request.otp,
+        OTPDB.is_used == False
+    ).order_by(OTPDB.created_at.desc()).first()
+    
+    if not otp_db:
+        return {"success": False, "message": "Invalid OTP"}
+    
+    # Check if OTP has expired
+    now = datetime.now(IST)
+    if now > otp_db.expires_at:
+        return {"success": False, "message": "OTP has expired. Please request a new one."}
+    
+    # Mark OTP as used
+    otp_db.is_used = True
+    db.commit()
+    
+    # Get user and return user data
+    user_db = db.query(UserDB).filter(UserDB.email == request.email).first()
+    if not user_db:
+        return {"success": False, "message": "User not found"}
+    
+    if user_db.isBanned:
+        return {"success": False, "message": "This account has been banned."}
+    
     return {"success": True, "user": db_to_user(user_db)}
+
+@app.post("/resend-otp")
+def resend_otp(request: dict, db: Session = Depends(get_db)):
+    """Resend OTP to user's email"""
+    email = request.get("email")
+    if not email:
+        return {"success": False, "message": "Email is required"}
+    
+    # Check if user exists
+    user_db = db.query(UserDB).filter(UserDB.email == email).first()
+    if not user_db:
+        return {"success": False, "message": "User not found"}
+    
+    # Generate new OTP
+    otp_code = generate_otp()
+    expires_at = datetime.now(IST) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    
+    # Store OTP in database
+    otp_db = OTPDB(
+        email=email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+        is_used=False
+    )
+    db.add(otp_db)
+    db.commit()
+    
+    # Send OTP via email
+    email_sent = send_otp_email(email, otp_code)
+    
+    if not email_sent:
+        print(f"[RESEND OTP] OTP generated but email not sent: {otp_code}")
+    
+    return {
+        "success": True,
+        "message": "OTP resent to your email",
+        # For development/testing
+        "otp_hint": otp_code if not email_sent else None
+    }
 
 @app.post("/signup", response_model=User)
 def signup(user: User, db: Session = Depends(get_db)):
@@ -1400,6 +1591,32 @@ def get_reports(db: Session = Depends(get_db)):
         reports.append(Report(id=r.id, pollId=r.pollId, comment=comment, reportedBy=reportedBy, timestamp=r.timestamp.isoformat(), status=r.status, reason=r.reason))
     return reports
 
+def get_allowed_redemption_amount(successful_redemptions: int) -> int:
+    """
+    Calculate the allowed redemption amount based on redemption count.
+    First time: 100 coins
+    Second time onwards: 1000, 2000, 3000, etc. (+1000 each time)
+    """
+    if successful_redemptions == 0:
+        return 100
+    else:
+        return 1000 * successful_redemptions
+
+@app.get("/users/{user_id}/allowed-redemption")
+def get_user_allowed_redemption(user_id: str, db: Session = Depends(get_db)):
+    """Get the allowed redemption amount for a user based on their redemption history."""
+    user_db = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    allowed_amount = get_allowed_redemption_amount(user_db.successfulRedemptions or 0)
+    return {
+        "userId": user_id,
+        "successfulRedemptions": user_db.successfulRedemptions or 0,
+        "allowedAmount": allowed_amount,
+        "currentCoins": user_db.coins or 0
+    }
+
 @app.post("/redemption-requests", response_model=RedemptionRequest)
 def add_redemption_request(request: RedemptionRequest, db: Session = Depends(get_db)):
     request_db = RedemptionRequestDB(id=request.id, user_id=request.user.id, amount=request.amount, paymentDetails=request.paymentDetails, status=request.status, requestedAt=date_parser.parse(request.requestedAt), updatedAt=date_parser.parse(request.updatedAt) if request.updatedAt else None, adminNotes=request.adminNotes)
@@ -1425,27 +1642,44 @@ def update_redemption_request_status(request_id: str, request_data: Dict[str, st
     new_status = request_data.get("status", request_db.status)
     old_status = request_db.status
 
-    # If status is being changed to "approved" or "processed" and coins haven't been deducted yet, deduct coins
-    if new_status in ["approved", "processed"] and old_status not in ["approved", "processed"]:
-        user_db = db.query(UserDB).filter(UserDB.id == request_db.user_id).first()
-        if not user_db:
-            raise HTTPException(status_code=404, detail="User account not found")
+    user_db = db.query(UserDB).filter(UserDB.id == request_db.user_id).first()
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User account not found")
 
+    # Coins are deducted when redemption request is created (via /users/{user_id}/coins/decrement)
+    # Handle status transitions
+    
+    # When approving/processing a redemption for the first time
+    if new_status in ["approved", "processed"] and old_status not in ["approved", "processed"]:
+        # Increment successful redemptions count
+        user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
+        print(f"[redemption] Approved redemption for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+    
+    # When rejecting a redemption
+    elif new_status == "rejected" and old_status != "rejected":
+        # Refund coins to user's account
+        user_db.coins += request_db.amount
+        print(f"[redemption] Refunded {request_db.amount} coins to user {user_db.id}. New balance: {user_db.coins}")
+        
+        # If this was previously approved/processed, decrement successful redemptions
+        if old_status in ["approved", "processed"]:
+            user_db.successfulRedemptions = max(0, (user_db.successfulRedemptions or 0) - 1)
+            print(f"[redemption] Reversed approval for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+    
+    # If a rejected request is being re-approved, deduct coins again
+    elif old_status == "rejected" and new_status in ["approved", "processed", "pending"]:
         # Check if user has enough coins
         if user_db.coins < request_db.amount:
             raise HTTPException(status_code=400, detail=f"User does not have enough coins. Current balance: {user_db.coins}, Required: {request_db.amount}")
-
+        
         # Deduct coins from user's account
         user_db.coins -= request_db.amount
-        print(f"[redemption] Deducted {request_db.amount} coins from user {user_db.id}. New balance: {user_db.coins}")
-
-    # If status is being changed from "approved" or "processed" to "pending" or "rejected", refund coins
-    elif old_status in ["approved", "processed"] and new_status not in ["approved", "processed"]:
-        user_db = db.query(UserDB).filter(UserDB.id == request_db.user_id).first()
-        if user_db:
-            # Refund coins to user's account
-            user_db.coins += request_db.amount
-            print(f"[redemption] Refunded {request_db.amount} coins to user {user_db.id}. New balance: {user_db.coins}")
+        print(f"[redemption] Re-deducted {request_db.amount} coins from user {user_db.id} (reversing rejection). New balance: {user_db.coins}")
+        
+        # If moving to approved/processed, increment successful redemptions
+        if new_status in ["approved", "processed"]:
+            user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
+            print(f"[redemption] Re-approved redemption for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
 
     request_db.status = new_status
     request_db.adminNotes = request_data.get("adminNotes", request_db.adminNotes)
