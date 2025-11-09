@@ -551,8 +551,8 @@ def send_otp_email(recipient_email: str, otp_code: str):
             return False
         
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = 'Your PolliFy Login OTP'
-        msg['From'] = SENDER_EMAIL
+        msg['Subject'] = 'Your PollPlay Login OTP'
+        msg['From'] = f'PollPlay App <{SENDER_EMAIL}>'
         msg['To'] = recipient_email
         
         # Create HTML email body
@@ -560,7 +560,7 @@ def send_otp_email(recipient_email: str, otp_code: str):
         <html>
           <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
             <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-              <h2 style="color: #4F46E5; margin-bottom: 20px;">PolliFy Login Verification</h2>
+              <h2 style="color: #4F46E5; margin-bottom: 20px;">PollPlay Login Verification</h2>
               <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
                 Your One-Time Password (OTP) for login is:
               </p>
@@ -575,7 +575,7 @@ def send_otp_email(recipient_email: str, otp_code: str):
               </p>
               <hr style="border: none; border-top: 1px solid #E5E7EB; margin: 20px 0;">
               <p style="font-size: 12px; color: #999; text-align: center;">
-                This is an automated message from PolliFy. Please do not reply to this email.
+                This is an automated message from PollPlay App. Please do not reply to this email.
               </p>
             </div>
           </body>
