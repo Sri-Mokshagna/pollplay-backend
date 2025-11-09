@@ -1404,6 +1404,8 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 @app.post("/verify-otp")
 def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     """Verify OTP and complete login for non-admin users"""
+    print(f"[VERIFY-OTP] Verifying OTP for: {request.email}")
+    
     # Find the most recent unused OTP for this email
     otp_db = db.query(OTPDB).filter(
         OTPDB.email == request.email,
@@ -1412,25 +1414,37 @@ def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     ).order_by(OTPDB.created_at.desc()).first()
     
     if not otp_db:
+        print(f"[VERIFY-OTP] Invalid OTP for: {request.email}")
         return {"success": False, "message": "Invalid OTP"}
     
     # Check if OTP has expired
     now = datetime.now(IST)
-    if now > otp_db.expires_at:
+    expires_at = otp_db.expires_at
+    
+    # Handle timezone-naive datetime from database (PostgreSQL might return naive)
+    if expires_at.tzinfo is None:
+        expires_at = IST.localize(expires_at)
+    
+    if now > expires_at:
+        print(f"[VERIFY-OTP] Expired OTP for: {request.email}")
         return {"success": False, "message": "OTP has expired. Please request a new one."}
     
     # Mark OTP as used
     otp_db.is_used = True
     db.commit()
+    print(f"[VERIFY-OTP] OTP marked as used for: {request.email}")
     
     # Get user and return user data
     user_db = db.query(UserDB).filter(UserDB.email == request.email).first()
     if not user_db:
+        print(f"[VERIFY-OTP] User not found: {request.email}")
         return {"success": False, "message": "User not found"}
     
     if user_db.isBanned:
+        print(f"[VERIFY-OTP] Banned user attempted verification: {request.email}")
         return {"success": False, "message": "This account has been banned."}
     
+    print(f"[VERIFY-OTP] ✓ OTP verified successfully for: {request.email}")
     return {"success": True, "user": db_to_user(user_db)}
 
 @app.post("/resend-otp")
