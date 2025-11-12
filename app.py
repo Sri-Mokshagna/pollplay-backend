@@ -457,7 +457,7 @@ class AdsStats(BaseModel):
 
 class RewardBody(BaseModel):
     userId: str
-    amount: int = 5
+    amount: int = 1
 
 class LoginRequest(BaseModel):
     email: str
@@ -477,6 +477,9 @@ class CoinValueBody(BaseModel):
 class ReferralRewardsBody(BaseModel):
     referrerCoins: int
     refereeCoins: int
+
+class AdRewardBody(BaseModel):
+    coinsPerAd: int
 
 # Chat Pydantic models
 class PublicKeyBody(BaseModel):
@@ -983,7 +986,15 @@ def post_ads_reward(body: RewardBody, db: Session = Depends(get_db)):
         before = int(user_db.coins or 0)
     except Exception:
         before = 0
-    grant = max(0, int(body.amount or 0))
+    # Use configured ad reward amount from settings (default: 1)
+    if body.amount == 1:  # If using default, check settings
+        coins_setting = get_setting(db, "adRewardCoins", "1")
+        try:
+            grant = max(0, int(coins_setting))
+        except Exception:
+            grant = 1
+    else:
+        grant = max(0, int(body.amount or 0))
     try:
         # Update coins
         user_db.coins = before + grant
@@ -1215,6 +1226,22 @@ def get_referral_rewards(db: Session = Depends(get_db)):
 def put_referral_rewards(body: ReferralRewardsBody, db: Session = Depends(get_db)):
     set_setting(db, "referralReferrerCoins", str(body.referrerCoins))
     set_setting(db, "referralRefereeCoins", str(body.refereeCoins))
+    return {"success": True}
+
+@app.get("/settings/ad-reward")
+def get_ad_reward(db: Session = Depends(get_db)):
+    """Get coins per ad reward (default: 1)"""
+    coins = get_setting(db, "adRewardCoins", "1")
+    try:
+        coins_i = int(coins)
+    except Exception:
+        coins_i = 1
+    return {"coinsPerAd": coins_i}
+
+@app.put("/settings/ad-reward")
+def put_ad_reward(body: AdRewardBody, db: Session = Depends(get_db)):
+    """Update coins per ad reward (admin only)"""
+    set_setting(db, "adRewardCoins", str(body.coinsPerAd))
     return {"success": True}
 
 # =============================
@@ -1583,7 +1610,8 @@ def update_user(user_id: str, user: User, db: Session = Depends(get_db)):
     user_db.password = user.password
     user_db.avatar = user.avatar
     user_db.isAdmin = user.isAdmin
-    # Do NOT set coins from client payload to avoid overwriting server-side balance
+    # Allow coins update (typically for admin panel)
+    user_db.coins = user.coins
     user_db.dailyAttempts = user.dailyAttempts
     user_db.lastAttemptDate = date_parser.parse(user.lastAttemptDate)
     user_db.isBanned = user.isBanned
