@@ -986,15 +986,12 @@ def post_ads_reward(body: RewardBody, db: Session = Depends(get_db)):
         before = int(user_db.coins or 0)
     except Exception:
         before = 0
-    # Use configured ad reward amount from settings (default: 1)
-    if body.amount == 1:  # If using default, check settings
-        coins_setting = get_setting(db, "adRewardCoins", "1")
-        try:
-            grant = max(0, int(coins_setting))
-        except Exception:
-            grant = 1
-    else:
-        grant = max(0, int(body.amount or 0))
+    # Always use configured ad reward amount from settings (default: 1)
+    coins_setting = get_setting(db, "adRewardCoins", "1")
+    try:
+        grant = max(1, int(coins_setting))  # Minimum 1 coin
+    except Exception:
+        grant = 1
     try:
         # Update coins
         user_db.coins = before + grant
@@ -1775,12 +1772,10 @@ def add_redemption_request(request: RedemptionRequest, db: Session = Depends(get
     request_db = RedemptionRequestDB(id=request.id, user_id=request.user.id, amount=request.amount, paymentDetails=request.paymentDetails, status=request.status, requestedAt=date_parser.parse(request.requestedAt), updatedAt=date_parser.parse(request.updatedAt) if request.updatedAt else None, adminNotes=request.adminNotes)
     db.add(request_db)
     
-    # Increment successfulRedemptions count when redemption request is created
-    # This ensures the next redemption uses the correct amount requirement
+    # Do not increment successfulRedemptions count when redemption request is created
+    # It should only be incremented when the redemption is approved
     user_db = db.query(UserDB).filter(UserDB.id == request.user.id).first()
-    if user_db:
-        user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
-        print(f"[redemption] Created redemption request for user {user_db.id}. Successful redemptions count: {user_db.successfulRedemptions}")
+    print(f"[redemption] Created redemption request for user {request.user.id}. Current successful redemptions count: {user_db.successfulRedemptions if user_db else 0}")
     
     db.commit()
     
@@ -1808,21 +1803,29 @@ def update_redemption_request_status(request_id: str, request_data: Dict[str, st
     if not user_db:
         raise HTTPException(status_code=404, detail="User account not found")
 
-    # Coins are deducted and successfulRedemptions is incremented when redemption request is created
+    # Coins are deducted when redemption request is created
+    # successfulRedemptions is incremented only when redemption is approved
     # Handle status transitions
     
+    # When approving a redemption for the first time
+    if new_status == "approved" and old_status != "approved":
+        # Increment successful redemptions count since this redemption is being approved
+        user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
+        print(f"[redemption] Approved redemption for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+    
     # When rejecting a redemption
-    if new_status == "rejected" and old_status != "rejected":
+    elif new_status == "rejected" and old_status != "rejected":
         # Refund coins to user's account
         user_db.coins += request_db.amount
         print(f"[redemption] Refunded {request_db.amount} coins to user {user_db.id}. New balance: {user_db.coins}")
         
-        # Decrement successful redemptions count since this redemption is being rejected
-        user_db.successfulRedemptions = max(0, (user_db.successfulRedemptions or 0) - 1)
-        print(f"[redemption] Decremented redemption count for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+        # If this was previously approved, decrement successful redemptions count
+        if old_status == "approved":
+            user_db.successfulRedemptions = max(0, (user_db.successfulRedemptions or 0) - 1)
+            print(f"[redemption] Decremented redemption count for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
     
-    # If a rejected request is being re-submitted (moved back to pending/approved/processed)
-    elif old_status == "rejected" and new_status in ["approved", "processed", "pending"]:
+    # If a rejected request is being re-submitted (moved back to pending/approved)
+    elif old_status == "rejected" and new_status in ["approved", "pending"]:
         # Check if user has enough coins
         if user_db.coins < request_db.amount:
             raise HTTPException(status_code=400, detail=f"User does not have enough coins. Current balance: {user_db.coins}, Required: {request_db.amount}")
@@ -1831,9 +1834,17 @@ def update_redemption_request_status(request_id: str, request_data: Dict[str, st
         user_db.coins -= request_db.amount
         print(f"[redemption] Re-deducted {request_db.amount} coins from user {user_db.id} (reversing rejection). New balance: {user_db.coins}")
         
-        # Re-increment successful redemptions
-        user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
-        print(f"[redemption] Re-incremented redemption count for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+        # If moving to approved, increment successful redemptions
+        if new_status == "approved":
+            user_db.successfulRedemptions = (user_db.successfulRedemptions or 0) + 1
+            print(f"[redemption] Incremented redemption count for user {user_db.id}. Successful redemptions: {user_db.successfulRedemptions}")
+    
+    # If moving from approved to rejected
+    elif old_status == "approved" and new_status == "rejected":
+        # Refund coins and decrement successful redemptions
+        user_db.coins += request_db.amount
+        user_db.successfulRedemptions = max(0, (user_db.successfulRedemptions or 0) - 1)
+        print(f"[redemption] Rejected previously approved redemption for user {user_db.id}. Refunded {request_db.amount} coins, decremented count. Balance: {user_db.coins}, Successful redemptions: {user_db.successfulRedemptions}")
 
     request_db.status = new_status
     request_db.adminNotes = request_data.get("adminNotes", request_db.adminNotes)
